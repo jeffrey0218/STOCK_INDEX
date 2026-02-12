@@ -74,6 +74,50 @@ def fmt_price(x, ccy):
 	except Exception:
 		return "N/A"
 
+def _cache_dir():
+	base = os.path.dirname(os.path.abspath(__file__))
+	path = os.path.join(base, "cache")
+	os.makedirs(path, exist_ok=True)
+	return path
+
+def _cache_path():
+	return os.path.join(_cache_dir(), "stock_cache.json")
+
+def _load_cache(today_str: str) -> Dict[str, Any]:
+	path = _cache_path()
+	try:
+		with open(path, "r", encoding="utf-8") as f:
+			data = json.load(f)
+		if data.get("date") != today_str:
+			return {"date": today_str, "items": {}}
+		if "items" not in data or not isinstance(data.get("items"), dict):
+			data["items"] = {}
+		return data
+	except Exception:
+		return {"date": today_str, "items": {}}
+
+def _to_jsonable(value):
+	if isinstance(value, dict):
+		return {k: _to_jsonable(v) for k, v in value.items()}
+	if isinstance(value, list):
+		return [_to_jsonable(v) for v in value]
+	try:
+		json.dumps(value)
+		return value
+	except Exception:
+		try:
+			return float(value)
+		except Exception:
+			return str(value)
+
+def _save_cache(cache_data: Dict[str, Any]):
+	path = _cache_path()
+	try:
+		with open(path, "w", encoding="utf-8") as f:
+			json.dump(_to_jsonable(cache_data), f, ensure_ascii=False)
+	except Exception:
+		pass
+
 def merge_display_name(symbol: str, en_name: str) -> str:
 	cn = CHINESE_NAME_MAP.get(symbol)
 	if not cn:
@@ -677,6 +721,8 @@ def home():
 	tickers_param = request.args.get("tickers", "")
 	symbols = [t.strip() for t in tickers_param.split(",") if t.strip()] if tickers_param else DEFAULT_TICKERS[:]
 	current_symbols = symbols[:]
+	today_str = datetime.now().strftime("%Y-%m-%d")
+	cache_data = _load_cache(today_str)
 	known_list = [
 		{
 			"symbol": s,
@@ -687,6 +733,10 @@ def home():
 	rows=[]; errors=[]
 	for sym in symbols:
 		try:
+			cached_row = cache_data.get("items", {}).get(sym)
+			if cached_row:
+				rows.append(cached_row)
+				continue
 			t = yf.Ticker(sym)
 			try:
 				info_full = t.get_info();
@@ -764,8 +814,10 @@ def home():
 				"win_rate": win_rate_disp,
 				"price": fmt_price(price, currency),
 			})
+			cache_data.setdefault("items", {})[sym] = rows[-1]
 		except Exception as e:
 			errors.append(f"{sym}: {str(e)}"); traceback.print_exc()
+	_save_cache(cache_data)
 
 	generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 	table_rows_html=""
