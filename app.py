@@ -1,14 +1,16 @@
 import os
 import math
 import traceback
+import json
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import yfinance as yf
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import smtplib
+try:
+	from yfinance import Search as YFSearch
+except Exception:
+	YFSearch = None
 
 app = Flask(__name__)
 
@@ -633,27 +635,55 @@ def compute_risk_alert(price, cheap, fair, expensive, analyst_low, analyst_mean,
 	except Exception:
 		return ("—", "risk-low")
 
-def email_html(to_addr: str, subject: str, html_body: str):
-	host=os.environ.get("SMTP_HOST"); port=int(os.environ.get("SMTP_PORT","465"))
-	user=os.environ.get("SMTP_USER"); pwd=os.environ.get("SMTP_PASS")
-	mail_from=os.environ.get("MAIL_FROM", user)
-	if not all([host, port, user, pwd, mail_from]):
-		return False, "SMTP 環境變數未完整設定（需 SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/MAIL_FROM）"
-	try:
-		msg=MIMEMultipart(); msg["Subject"]=subject; msg["From"]=mail_from; msg["To"]=to_addr
-		msg.attach(MIMEText(html_body,"html",_charset="utf-8"))
-		with smtplib.SMTP_SSL(host=host, port=port) as smtp:
-			smtp.login(user=user, password=pwd); smtp.sendmail(mail_from,[to_addr],msg.as_string())
-		return True, "已寄出"
-	except Exception as e:
-		return False, f"寄信失敗：{e}"
-
 # ================== 主頁 ==================
+@app.route("/api/search", methods=["GET"])
+def api_search():
+	q = request.args.get("q", "").strip()
+	limit = int(request.args.get("limit", "12") or 12)
+	if not q:
+		return jsonify({"ok": True, "data": []})
+	results = []
+	# 先從內建清單模糊比對
+	q_lower = q.lower()
+	for sym, name in CHINESE_NAME_MAP.items():
+		if q_lower in sym.lower() or q_lower in name.lower():
+			results.append({"symbol": sym, "name": name})
+	# 使用 Yahoo Finance 搜尋
+	if YFSearch is not None:
+		try:
+			search = YFSearch(q)
+			quotes = getattr(search, "quotes", []) or []
+			for item in quotes:
+				symbol = item.get("symbol") or ""
+				name = item.get("shortname") or item.get("longname") or item.get("name") or symbol
+				if symbol:
+					results.append({"symbol": symbol, "name": name})
+		except Exception:
+			pass
+	# 去重並限制筆數
+	seen = set()
+	unique = []
+	for r in results:
+		key = r.get("symbol", "")
+		if key and key not in seen:
+			seen.add(key)
+			unique.append(r)
+		if len(unique) >= limit:
+			break
+	return jsonify({"ok": True, "data": unique})
+
 @app.route("/", methods=["GET"])
 def home():
 	tickers_param = request.args.get("tickers", "")
-	send_email_flag = request.args.get("send_email", "0").strip().lower() in ["1","true","yes"]
 	symbols = [t.strip() for t in tickers_param.split(",") if t.strip()] if tickers_param else DEFAULT_TICKERS[:]
+	current_symbols = symbols[:]
+	known_list = [
+		{
+			"symbol": s,
+			"name": merge_display_name(s, CHINESE_NAME_MAP.get(s, s))
+		}
+		for s in DEFAULT_TICKERS
+	]
 	rows=[]; errors=[]
 	for sym in symbols:
 		try:
@@ -772,11 +802,23 @@ def home():
 		  <td>{r['advice']}</td>
 		</tr>"""
 
+	current_symbols_json = json.dumps(current_symbols, ensure_ascii=False)
+	known_list_json = json.dumps(known_list, ensure_ascii=False)
 	html = f"""
 	<html><head><meta charset='utf-8'/><title>股票估值儀表板</title>
 	<style>
 	  body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans TC","Microsoft JhengHei",Arial,sans-serif; }}
 	  .container {{ max-width:98%; margin:20px auto; }}
+	  .toolbar {{ display:flex; flex-direction:column; gap:8px; margin:12px 0 16px; }}
+	  .search-row {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+	  .search-row input {{ padding:8px 10px; min-width:260px; border:1px solid #ccc; border-radius:6px; }}
+	  .search-row button {{ padding:8px 12px; border:0; background:#1976d2; color:#fff; border-radius:6px; cursor:pointer; }}
+	  .search-row button.secondary {{ background:#546e7a; }}
+	  .search-results {{ display:flex; flex-wrap:wrap; gap:6px; }}
+	  .search-item {{ background:#f1f5f9; padding:6px 8px; border-radius:6px; cursor:pointer; font-size:12px; }}
+	  .watchlist {{ display:flex; flex-wrap:wrap; gap:6px; }}
+	  .watch-chip {{ background:#e8f0fe; padding:6px 8px; border-radius:999px; font-size:12px; display:flex; align-items:center; gap:6px; }}
+	  .watch-chip button {{ border:0; background:#ef4444; color:#fff; border-radius:999px; padding:0 6px; cursor:pointer; }}
 	  table {{ width:100%; border-collapse:collapse; }}
 	  th,td {{ border:1px solid #ddd; padding:8px; font-size:14px; vertical-align:top; }}
 	  th {{ background:#f6f8fa; position:sticky; top:0; }}
@@ -790,7 +832,16 @@ def home():
 	  <div class='container'>
 		<h1>股票估值儀表板</h1>
 		<div class='meta'>生成時間：{generated_at} | 資料：Yahoo Finance（yfinance）</div>
-		<div class='meta'>使用：?tickers=AAPL,MSFT,2330.TW 自訂；?send_email=1 寄送報表</div>
+			<div class='meta'>使用：?tickers=AAPL,MSFT,2330.TW 自訂</div>
+		<div class='toolbar'>
+		  <div class='search-row'>
+			<input id='stockSearch' type='text' placeholder='輸入股票代號或關鍵字，例如：AAPL / 台積電' />
+			<button id='addBtn'>加入列表</button>
+			<button id='clearBtn' class='secondary'>清空列表</button>
+		  </div>
+		  <div class='search-results' id='searchResults'></div>
+		  <div class='watchlist' id='watchList'></div>
+		</div>
 		<table><thead><tr>
 		  <th>股票代號</th><th>名稱</th><th>類型</th><th>目前價位</th><th>條件</th>
 		  <th>便宜價</th><th>合理價</th><th>昂貴價</th><th>分析師價位區間</th><th>有效期限</th>
@@ -798,17 +849,122 @@ def home():
 		</tr></thead><tbody>
 		{table_rows_html}
 		</tbody></table>
+		<script id='current-tickers' type='application/json'>{current_symbols_json}</script>
+		<script id='known-tickers' type='application/json'>{known_list_json}</script>
+		<script>
+		(() => {{
+		  const currentTickers = JSON.parse(document.getElementById('current-tickers').textContent || '[]');
+		  const knownTickers = JSON.parse(document.getElementById('known-tickers').textContent || '[]');
+		  const searchInput = document.getElementById('stockSearch');
+		  const resultsEl = document.getElementById('searchResults');
+		  const watchEl = document.getElementById('watchList');
+		  const addBtn = document.getElementById('addBtn');
+		  const clearBtn = document.getElementById('clearBtn');
+		  let lastController = null;
+		
+		  const normalize = (v) => (v || '').toString().trim();
+		  const uniqueList = (arr) => Array.from(new Set(arr.filter(Boolean)));
+		  const debounce = (fn, wait = 250) => {{
+			let t = null;
+			return (...args) => {{
+			  if (t) clearTimeout(t);
+			  t = setTimeout(() => fn(...args), wait);
+			}};
+		  }};
+		
+		  const updateUrl = (list) => {{
+			const url = new URL(window.location.href);
+			if (list.length) url.searchParams.set('tickers', list.join(','));
+			else url.searchParams.delete('tickers');
+			window.location.href = url.toString();
+		  }};
+		
+		  const renderWatchlist = () => {{
+			watchEl.innerHTML = '';
+			currentTickers.forEach((sym) => {{
+			  const chip = document.createElement('span');
+			  chip.className = 'watch-chip';
+			  chip.textContent = sym;
+			  const btn = document.createElement('button');
+			  btn.textContent = '×';
+			  btn.title = '刪除';
+			  btn.addEventListener('click', () => {{
+				const next = currentTickers.filter((s) => s !== sym);
+				updateUrl(next);
+			  }});
+			  chip.appendChild(btn);
+			  watchEl.appendChild(chip);
+			}});
+		  }};
+		
+		  const renderResults = (keyword, external = []) => {{
+			resultsEl.innerHTML = '';
+			const kw = normalize(keyword).toLowerCase();
+			if (!kw) return;
+			const localHits = knownTickers
+			  .filter((k) => (k.symbol || '').toLowerCase().includes(kw) || (k.name || '').toLowerCase().includes(kw));
+			const merged = [...localHits, ...external].filter(Boolean);
+			const seen = new Set();
+			const hits = merged.filter((k) => {{
+			  if (!k.symbol || seen.has(k.symbol)) return false;
+			  seen.add(k.symbol);
+			  return true;
+			}}).slice(0, 12);
+			hits.forEach((k) => {{
+			  const el = document.createElement('span');
+			  el.className = 'search-item';
+			  el.textContent = `${{k.symbol}} · ${{k.name}}`;
+			  el.addEventListener('click', () => addTicker(k.symbol));
+			  resultsEl.appendChild(el);
+			}});
+		  }};
+		
+		  const fetchYahoo = async (keyword) => {{
+			const kw = normalize(keyword);
+			if (!kw) return [];
+			if (lastController) lastController.abort();
+			lastController = new AbortController();
+			try {{
+			  const url = new URL('/api/search', window.location.origin);
+			  url.searchParams.set('q', kw);
+			  const res = await fetch(url.toString(), {{ signal: lastController.signal }});
+			  const data = await res.json();
+			  return (data && data.data) ? data.data : [];
+			}} catch (e) {{
+			  return [];
+			}}
+		  }};
+		
+		  const addTicker = (value) => {{
+			const sym = normalize(value);
+			if (!sym) return;
+			const next = uniqueList([...currentTickers, sym]);
+			updateUrl(next);
+		  }};
+		
+		  addBtn.addEventListener('click', () => addTicker(searchInput.value));
+		  clearBtn.addEventListener('click', () => updateUrl([]));
+		  const onInput = debounce(async (e) => {{
+			const keyword = e.target.value;
+			renderResults(keyword);
+			const external = await fetchYahoo(keyword);
+			renderResults(keyword, external);
+		  }}, 300);
+		  searchInput.addEventListener('input', onInput);
+		  searchInput.addEventListener('keydown', (e) => {{
+			if (e.key === 'Enter') {{
+			  e.preventDefault();
+			  addTicker(searchInput.value);
+			}}
+		  }});
+		
+		  renderWatchlist();
+		}})();
+		</script>
 	  </div>
 	</body></html>
 	"""
 
-	email_msg=""
-	if send_email_flag:
-		default_recipient = os.environ.get("MAIL_TO", "jeffrey@gis.tw")
-		ok,msg=email_html(default_recipient,"股票估值儀表板",html)
-		email_msg=f"<div class='meta'>寄信結果：{msg}</div>"
-	if email_msg:
-		html = html.replace("</div></body>", email_msg + "</div></body>")
 	return html
 
 if __name__ == "__main__":
