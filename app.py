@@ -687,12 +687,7 @@ def api_search():
 	if not q:
 		return jsonify({"ok": True, "data": []})
 	results = []
-	# 先從內建清單模糊比對
-	q_lower = q.lower()
-	for sym, name in CHINESE_NAME_MAP.items():
-		if q_lower in sym.lower() or q_lower in name.lower():
-			results.append({"symbol": sym, "name": name})
-	# 使用 Yahoo Finance 搜尋
+	# 使用 Yahoo Finance 搜尋（全市場）
 	if YFSearch is not None:
 		try:
 			search = YFSearch(q)
@@ -704,6 +699,12 @@ def api_search():
 					results.append({"symbol": symbol, "name": name})
 		except Exception:
 			pass
+	# 若無法呼叫 Yahoo Finance，退回內建清單模糊比對
+	if not results:
+		q_lower = q.lower()
+		for sym, name in CHINESE_NAME_MAP.items():
+			if q_lower in sym.lower() or q_lower in name.lower():
+				results.append({"symbol": sym, "name": name})
 	# 去重並限制筆數
 	seen = set()
 	unique = []
@@ -949,15 +950,10 @@ def home():
 			}});
 		  }};
 		
-		  const renderResults = (keyword, external = []) => {{
+		  const renderResults = (items = []) => {{
 			resultsEl.innerHTML = '';
-			const kw = normalize(keyword).toLowerCase();
-			if (!kw) return;
-			const localHits = knownTickers
-			  .filter((k) => (k.symbol || '').toLowerCase().includes(kw) || (k.name || '').toLowerCase().includes(kw));
-			const merged = [...localHits, ...external].filter(Boolean);
 			const seen = new Set();
-			const hits = merged.filter((k) => {{
+			const hits = (items || []).filter((k) => {{
 			  if (!k.symbol || seen.has(k.symbol)) return false;
 			  seen.add(k.symbol);
 			  return true;
@@ -998,9 +994,9 @@ def home():
 		  clearBtn.addEventListener('click', () => updateUrl([]));
 		  const onInput = debounce(async (e) => {{
 			const keyword = e.target.value;
-			renderResults(keyword);
+			resultsEl.innerHTML = '';
 			const external = await fetchYahoo(keyword);
-			renderResults(keyword, external);
+			renderResults(external);
 		  }}, 300);
 		  searchInput.addEventListener('input', onInput);
 		  searchInput.addEventListener('keydown', (e) => {{
