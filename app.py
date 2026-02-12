@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
 from flask import Flask, request, jsonify
+import requests
 import yfinance as yf
 try:
 	from yfinance import Search as YFSearch
@@ -117,6 +118,56 @@ def _save_cache(cache_data: Dict[str, Any]):
 			json.dump(_to_jsonable(cache_data), f, ensure_ascii=False)
 	except Exception:
 		pass
+
+def _tw_cache_path():
+	return os.path.join(_cache_dir(), "tw_symbols.json")
+
+def _load_tw_cache(today_str: str) -> Dict[str, Any]:
+	path = _tw_cache_path()
+	try:
+		with open(path, "r", encoding="utf-8") as f:
+			data = json.load(f)
+		if data.get("date") != today_str:
+			return {"date": today_str, "items": []}
+		if "items" not in data or not isinstance(data.get("items"), list):
+			data["items"] = []
+		return data
+	except Exception:
+		return {"date": today_str, "items": []}
+
+def _save_tw_cache(data: Dict[str, Any]):
+	path = _tw_cache_path()
+	try:
+		with open(path, "w", encoding="utf-8") as f:
+			json.dump(_to_jsonable(data), f, ensure_ascii=False)
+	except Exception:
+		pass
+
+def _fetch_tw_symbols(today_str: str) -> List[Dict[str, str]]:
+	cache_data = _load_tw_cache(today_str)
+	if cache_data.get("items"):
+		return cache_data["items"]
+	items: List[Dict[str, str]] = []
+	endpoints = [
+		("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", ".TW"),
+		("https://openapi.twse.com.tw/v1/opendata/t187ap03_O", ".TWO"),
+	]
+	for url, suffix in endpoints:
+		try:
+			resp = requests.get(url, timeout=12)
+			resp.raise_for_status()
+			data = resp.json()
+			if isinstance(data, list):
+				for row in data:
+					code = str(row.get("公司代號") or row.get("公司代碼") or "").strip()
+					name = str(row.get("公司簡稱") or row.get("公司名稱") or "").strip()
+					if code and name:
+						items.append({"symbol": f"{code}{suffix}", "name": name})
+		except Exception:
+			continue
+	cache_data = {"date": today_str, "items": items}
+	_save_tw_cache(cache_data)
+	return items
 
 def merge_display_name(symbol: str, en_name: str) -> str:
 	cn = CHINESE_NAME_MAP.get(symbol)
@@ -687,6 +738,20 @@ def api_search():
 	if not q:
 		return jsonify({"ok": True, "data": []})
 	results = []
+	q_lower = q.lower()
+	# 台股中文/代號動態查詢（上市/上櫃）
+	today_str = datetime.now().strftime("%Y-%m-%d")
+	try:
+		tw_symbols = _fetch_tw_symbols(today_str)
+		for item in tw_symbols:
+			sym = item.get("symbol", "")
+			name = item.get("name", "")
+			if q_lower in sym.lower() or q_lower in name.lower():
+				results.append({"symbol": sym, "name": name})
+				if len(results) >= limit:
+					break
+	except Exception:
+		pass
 	# 使用 Yahoo Finance 搜尋（全市場）
 	if YFSearch is not None:
 		try:
@@ -699,9 +764,8 @@ def api_search():
 					results.append({"symbol": symbol, "name": name})
 		except Exception:
 			pass
-	# 若無法呼叫 Yahoo Finance，退回內建清單模糊比對
+	# 若仍無結果，退回內建清單模糊比對
 	if not results:
-		q_lower = q.lower()
 		for sym, name in CHINESE_NAME_MAP.items():
 			if q_lower in sym.lower() or q_lower in name.lower():
 				results.append({"symbol": sym, "name": name})
