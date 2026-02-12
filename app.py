@@ -23,6 +23,15 @@ DEFAULT_TICKERS = [
 	"2330.TW", "2317.TW", "2454.TW", "2412.TW", "2881.TW","2327.TW", "2308.TW", "3293.TWO"
 ]
 
+TYPE_OPTIONS = [
+	"成長股",
+	"資產股",
+	"高股息/定存股",
+	"虧損轉機股",
+	"景氣循環股",
+	"穩定獲利股",
+]
+
 CHINESE_NAME_MAP = {
 	"AAPL": "蘋果",
 	"MSFT": "微軟",
@@ -263,6 +272,7 @@ def classify_type(info_full: Dict[str, Any]):
 		"dividendYield": dividend_yield,  # 已修正為真實比例
 		"dividendYield5Y": dividend_yield_avg,
 		"beta": beta,
+		"payoutRatio": safe_get(info_full, "payoutRatio", None),
 	}
 	return stock_type, applicable, cond
 
@@ -462,102 +472,51 @@ def analyst_range(info_full: Dict[str, Any]):
 		"rec": safe_get(info_full, "recommendationKey", None),
 	}
 
+def analyst_gap_ratio(fair, analyst_mean) -> float:
+	if fair is None or analyst_mean is None:
+		return None
+	try:
+		base = max(abs(float(fair)), 1e-6)
+		return abs(float(analyst_mean) - float(fair)) / base
+	except Exception:
+		return None
+
 def confidence_score(price, cheap, fair, expensive, analyst_mean, analyst_n, cond: Dict[str, Any]) -> str:
-	"""以估值距離、分析師一致性、波動、資料完整度計算信心度。"""
-	valuation_score = 30.0
-	if all(v is not None for v in [price, cheap, fair, expensive]) and fair not in [0, None]:
-		try:
-			ratio = abs(float(price) - float(fair)) / max(abs(float(fair)), 1e-6)
-			if ratio >= 0.30:
-				valuation_score = 90
-			elif ratio >= 0.20:
-				valuation_score = 80
-			elif ratio >= 0.12:
-				valuation_score = 70
-			elif ratio >= 0.06:
-				valuation_score = 55
-			else:
-				valuation_score = 40
-		except Exception:
-			valuation_score = 35
-
-	analyst_score = 35.0
-	if analyst_mean and fair:
-		try:
-			base = max(abs(float(analyst_mean)), abs(float(fair)), 1e-6)
-			gap = abs(float(fair) - float(analyst_mean)) / base
-			if gap <= 0.10:
-				analyst_score = 85
-			elif gap <= 0.20:
-				analyst_score = 72
-			elif gap <= 0.35:
-				analyst_score = 58
-			else:
-				analyst_score = 42
-		except Exception:
-			analyst_score = 40
-	else:
-		if analyst_n:
-			if analyst_n >= 12:
-				analyst_score = 78
-			elif analyst_n >= 6:
-				analyst_score = 68
-			elif analyst_n >= 3:
-				analyst_score = 55
-			else:
-				analyst_score = 40
-
+	"""以估值一致性、分析師一致性、波動與獲利品質計算信心度。"""
+	score = 50.0
+	if all(v is not None for v in [price, cheap, fair, expensive]):
+		score += 10
+	gap = analyst_gap_ratio(fair, analyst_mean)
+	if gap is not None:
+		if gap <= 0.15:
+			score += 15
+		else:
+			score -= 20
 	beta = cond.get("beta")
-	if beta is None:
-		volatility_score = 60.0
-	else:
-		try:
-			if beta <= 0.9:
-				volatility_score = 85
-			elif beta <= 1.2:
-				volatility_score = 75
-			elif beta <= 1.6:
-				volatility_score = 60
-			elif beta <= 2.0:
-				volatility_score = 45
-			else:
-				volatility_score = 30
-		except Exception:
-			volatility_score = 55
-
-	data_score = 40.0
-	if all(v is not None for v in [cheap, fair, expensive]):
-		data_score += 20
-	if analyst_n and analyst_n >= 3:
-		data_score += 15
-	if cond.get("revenueGrowth") is not None:
-		data_score += 7
-	if cond.get("earningsGrowth") is not None:
-		data_score += 7
-	if cond.get("profitMargins") is not None:
-		data_score += 5
-	data_score = min(data_score, 95)
-
-	weights = {
-		"valuation": 0.35,
-		"analyst": 0.25,
-		"volatility": 0.25,
-		"data": 0.15,
-	}
-	composite = (
-		valuation_score * weights["valuation"]
-		+ analyst_score * weights["analyst"]
-		+ volatility_score * weights["volatility"]
-		+ data_score * weights["data"]
-	)
-
-	if composite >= 75:
+	if beta is not None:
+		if beta < 1.0:
+			score += 10
+		elif beta > 1.5:
+			score -= 10
+	profit_margin = cond.get("profitMargins")
+	if profit_margin is not None and profit_margin < 0:
+		score -= 15
+	payout_ratio = cond.get("payoutRatio")
+	if payout_ratio is not None and payout_ratio > 1.0:
+		score -= 10
+	if analyst_n is not None:
+		if analyst_n >= 6:
+			score += 5
+		elif analyst_n < 3:
+			score -= 5
+	score = max(0, min(100, score))
+	if score >= 80:
 		level = "高"
-	elif composite >= 55:
+	elif score >= 60:
 		level = "中"
 	else:
 		level = "低"
-	return f"{level} ({composite:.0f})"
+	return f"{level} ({score:.0f})"
 
 def suggest_action(price, cheap, fair, expensive):
 	if not price or not cheap or not fair or not expensive:
@@ -568,6 +527,35 @@ def suggest_action(price, cheap, fair, expensive):
 		elif price <= expensive: return "持有/減碼"
 		else: return "賣出/減碼"
 	except Exception: return "—"
+
+def suggest_action_with_analyst(price, cheap, fair, expensive, analyst_low, analyst_mean, analyst_high):
+	base = suggest_action(price, cheap, fair, expensive)
+	if base in ["資料不足", "—"]:
+		return base
+	gap = analyst_gap_ratio(fair, analyst_mean)
+	valuation_bias = "flat"
+	if price <= 0.95 * fair:
+		valuation_bias = "up"
+	elif price >= expensive:
+		valuation_bias = "down"
+	analyst_bias = "flat"
+	if analyst_mean is not None:
+		if analyst_mean >= price * 1.05:
+			analyst_bias = "up"
+		elif analyst_mean <= price * 0.95:
+			analyst_bias = "down"
+	elif analyst_low is not None and analyst_high is not None:
+		if price < analyst_low:
+			analyst_bias = "up"
+		elif price > analyst_high:
+			analyst_bias = "down"
+	if analyst_low is not None and price <= cheap and price <= analyst_low:
+		return "強烈買進"
+	if analyst_high is not None and price >= expensive and price >= analyst_high:
+		return "強烈賣出"
+	if gap is not None and gap > 0.15 and analyst_bias in ["up", "down"] and valuation_bias in ["up", "down"] and analyst_bias != valuation_bias:
+		return "觀望/分歧"
+	return base
 
 def evaluate_action_success(action: str, pct_change: float):
 	"""評估歷史操作是否命中方向。"""
@@ -585,7 +573,7 @@ def compute_operation_win_rate(ticker_obj, cheap, fair, expensive):
 	if not ticker_obj or not all(v is not None for v in [cheap, fair, expensive]):
 		return None
 	try:
-		required_checks = 10
+		required_checks = 12
 		hist = ticker_obj.history(period="13mo", interval="1mo")
 		if hist is None or hist.empty:
 			return None
@@ -670,6 +658,7 @@ def compute_risk_alert(price, cheap, fair, expensive, analyst_low, analyst_mean,
 			return ("資料不足", "risk-low")
 		reasons = []
 		score = 0
+		gap = analyst_gap_ratio(fair, analyst_mean)
 		# 估值過熱 / 過度低估
 		if price and expensive and (price - expensive) / expensive > 0.10:
 			score += 2; reasons.append("高於昂貴價10%+")
@@ -682,14 +671,12 @@ def compute_risk_alert(price, cheap, fair, expensive, analyst_low, analyst_mean,
 			score += 2; reasons.append("高於分析師高標5%+")
 		if analyst_low and price < analyst_low * 0.90:
 			score += 1; reasons.append("跌破分析師低標10%")
-		if analyst_mean and fair:
+		if gap is not None and gap > 0.15:
+			score += 2; reasons.append("估值分歧(模型 vs 分析師)")
+		if analyst_low and analyst_high and analyst_low > 0:
 			try:
-				base = min(abs(fair), abs(analyst_mean))
-				if base:
-					gap = abs(fair - analyst_mean) / base
-					if gap >= 1.0:
-						score += 1
-						reasons.append("模型與分析師均值差距100%+")
+				if analyst_high / analyst_low > 1.6:
+					score += 1; reasons.append("分析師分歧(區間過寬)")
 			except Exception:
 				pass
 		# 成長/獲利風險
@@ -698,6 +685,7 @@ def compute_risk_alert(price, cheap, fair, expensive, analyst_low, analyst_mean,
 		profit_margin = cond.get("profitMargins")
 		dividend_yield = cond.get("dividendYield")
 		beta = cond.get("beta")
+		payout_ratio = cond.get("payoutRatio")
 		if profit_margin is not None and profit_margin < 0:
 			score += 1; reasons.append("虧損")
 		if (earnings_growth is not None and earnings_growth < 0) and stock_type in ["成長股", "虧損轉機股"]:
@@ -710,6 +698,9 @@ def compute_risk_alert(price, cheap, fair, expensive, analyst_low, analyst_mean,
 				score += 2; reasons.append(f"Beta高({beta:.1f})")
 			elif beta > 1.6:
 				score += 1; reasons.append(f"Beta偏高({beta:.1f})")
+		# 配息風險
+		if payout_ratio is not None and payout_ratio > 1.0:
+			score += 1; reasons.append("配息率偏高")
 		# 股息可持續性 (簡易): 高殖利率但獲利為負
 		if dividend_yield and dividend_yield > 0.06 and profit_margin is not None and profit_margin < 0:
 			score += 1; reasons.append("高殖利率+虧損風險")
@@ -784,8 +775,20 @@ def api_search():
 @app.route("/", methods=["GET"])
 def home():
 	tickers_param = request.args.get("tickers", "")
+	types_param = request.args.get("types", "")
 	symbols = [t.strip() for t in tickers_param.split(",") if t.strip()] if tickers_param else DEFAULT_TICKERS[:]
 	current_symbols = symbols[:]
+	type_overrides: Dict[str, str] = {}
+	if types_param:
+		parts = [p.strip() for p in types_param.split(",") if p.strip()]
+		for part in parts:
+			if ":" not in part:
+				continue
+			sym, typ = part.split(":", 1)
+			sym = sym.strip()
+			typ = typ.strip()
+			if sym and typ in TYPE_OPTIONS:
+				type_overrides[sym] = typ
 	today_str = datetime.now().strftime("%Y-%m-%d")
 	cache_data = _load_cache(today_str)
 	known_list = [
@@ -798,7 +801,11 @@ def home():
 	rows=[]; errors=[]
 	for sym in symbols:
 		try:
-			cached_row = cache_data.get("items", {}).get(sym)
+			override_type = type_overrides.get(sym)
+			if override_type:
+				cached_row = None
+			else:
+				cached_row = cache_data.get("items", {}).get(sym)
 			if cached_row:
 				rows.append(cached_row)
 				continue
@@ -817,7 +824,8 @@ def home():
 			sector = safe_get(info_full, "sector", ""); industry = safe_get(info_full, "industry", "")
 			currency = safe_get(info_full, "currency", "") or safe_get(info_full, "financialCurrency", "") or ""
 			price = current_price(t, info_full)
-			stock_type, applicable, cond = classify_type(info_full)
+			auto_type, applicable, cond = classify_type(info_full)
+			stock_type = override_type if override_type in TYPE_OPTIONS else auto_type
 			applicable_str = f"（適用：{'、'.join(applicable)}）" if applicable else ""
 			val = compute_valuations(stock_type, applicable, info_full, price, ticker_obj=t)
 			ar = analyst_range(info_full)
@@ -833,9 +841,11 @@ def home():
 			win_rate_stats = compute_operation_win_rate(t, val["cheap"], val["fair"], val["expensive"])
 			if win_rate_stats:
 				win_rate_disp = f"{win_rate_stats['ratio']*100:.0f}% ({win_rate_stats['wins']}/{win_rate_stats['total']})"
+				if win_rate_stats["total"] < 12:
+					win_rate_disp += "，樣本偏少"
 			else:
 				win_rate_disp = "資料不足"
-			action = suggest_action(price, val["cheap"], val["fair"], val["expensive"])
+			action = suggest_action_with_analyst(price, val["cheap"], val["fair"], val["expensive"], ar["low"], ar["mean"], ar["high"])
 			cond_parts=[]
 			if sector: cond_parts.append(f"Sector: {sector}")
 			if industry: cond_parts.append(f"Industry: {industry}")
@@ -847,21 +857,22 @@ def home():
 			if val["method"]: cond_parts.append(f"估值法: {val['method']}")
 			if val["method_detail"]: cond_parts.append(val["method_detail"])
 			fair_raw = val.get("fair")
-			if ar.get("mean") and fair_raw:
-				try:
-					base = min(abs(fair_raw), abs(ar["mean"]))
-					if base:
-						gap = abs(fair_raw - ar["mean"]) / base
-						if gap >= 1.0:
-							cond_parts.append(f"模型 vs 分析師均值差距 {gap*100:.0f}%→重新評估")
-				except Exception:
-					pass
+			gap = analyst_gap_ratio(fair_raw, ar.get("mean"))
+			divergence = gap is not None and gap > 0.15
+			if divergence:
+				cond_parts.append(f"模型 vs 分析師均值差距 {gap*100:.0f}%")
 			cond_str = "；".join(cond_parts) if cond_parts else "—"
+			risk_tags = []
+			if risk_text not in ["—", "資料不足", "風險低"]:
+				risk_tags = [p.strip() for p in risk_text.split("、") if p.strip()]
 			rows.append({
 				"symbol": sym,
 				"name": name,
-				"type": f"{stock_type}{applicable_str}",
+				"type": stock_type,
+				"type_auto": auto_type,
+				"type_suffix": applicable_str,
 				"condition": cond_str,
+				"divergence": divergence,
 				"cheap_raw": val["cheap"],
 				"fair_raw": val["fair"],
 				"expensive_raw": val["expensive"],
@@ -873,13 +884,15 @@ def home():
 				"validity": validity,
 				"duration": movement_est,
 				"risk": risk_text,
+				"risk_tags": risk_tags,
 				"risk_level": risk_level,
 				"confidence": conf,
 				"advice": action,
 				"win_rate": win_rate_disp,
 				"price": fmt_price(price, currency),
 			})
-			cache_data.setdefault("items", {})[sym] = rows[-1]
+			if not override_type:
+				cache_data.setdefault("items", {})[sym] = rows[-1]
 		except Exception as e:
 			errors.append(f"{sym}: {str(e)}"); traceback.print_exc()
 	_save_cache(cache_data)
@@ -900,20 +913,35 @@ def home():
 		if highlight_key=="cheap_raw": cheap_disp=f'<span class="near-price">{cheap_disp}</span>'
 		elif highlight_key=="fair_raw": fair_disp=f'<span class="near-price">{fair_disp}</span>'
 		elif highlight_key=="expensive_raw": expensive_disp=f'<span class="near-price">{expensive_disp}</span>'
+		cond_extra = ""
+		if r.get("divergence"):
+			cond_extra = " <span class=\"flag-diverge\" title=\"估值分歧：模型合理價與分析師均值差距>15%\">DIV</span>"
+		risk_cell = r["risk"]
+		risk_tags = r.get("risk_tags") or []
+		if risk_tags:
+			tags_html = "".join([f'<span class="risk-tag">{t}</span>' for t in risk_tags])
+			risk_cell = f'<span class="risk-tags" title="{r["risk"]}">{tags_html}</span>'
+		type_selected = "auto" if r.get("type") == r.get("type_auto") else r.get("type")
+		auto_label = f"自動判斷（{r.get('type_auto')}）"
+		options = [f'<option value="auto"{(" selected" if type_selected=="auto" else "")}>{auto_label}</option>']
+		for opt in TYPE_OPTIONS:
+			selected = " selected" if type_selected == opt else ""
+			options.append(f'<option value="{opt}"{selected}>{opt}</option>')
+		type_select_html = f'<select class="type-select" data-symbol="{r["symbol"]}">{"".join(options)}</select>'
 		table_rows_html += f"""
 		<tr>
 		  <td>{r['symbol']}</td>
 		  <td>{r['name']}</td>
-		  <td>{r['type']}</td>
+		  <td>{type_select_html}<span class="type-suffix">{r.get('type_suffix','')}</span></td>
 		  <td>{r['price']}</td>
-		  <td style=\"max-width:480px;white-space:normal;\">{r['condition']}</td>
+		  <td style=\"max-width:480px;white-space:normal;\">{r['condition']}{cond_extra}</td>
 		  <td>{cheap_disp}</td>
 		  <td>{fair_disp}</td>
 		  <td>{expensive_disp}</td>
 		  <td>{r['analyst']}</td>
 		  <td>{r['validity']}</td>
 		  <td>{r['duration']}</td>
-		  <td class=\"{r['risk_level']}\">{r['risk']}</td>
+		  <td class=\"{r['risk_level']}\">{risk_cell}</td>
 		  <td>{r['confidence']}</td>
 		  <td>{r['win_rate']}</td>
 		  <td>{r['advice']}</td>
@@ -921,6 +949,59 @@ def home():
 
 	current_symbols_json = json.dumps(current_symbols, ensure_ascii=False)
 	known_list_json = json.dumps(known_list, ensure_ascii=False)
+	type_overrides_json = json.dumps(type_overrides, ensure_ascii=False)
+	tips_payload = {
+		"risk": {
+			"title": "風險提醒（多標籤）",
+			"bullets": [
+				"以 score 計分，並把觸發條件轉成標籤（最多顯示 4 個）。",
+				"估值過熱：高於昂貴價 10%+（+2）；或高於合理價 10%+（+1）。",
+				"估值偏低：遠低於便宜價 15%+（+1）。",
+				"分析師偏離：高於分析師高標 5%+（+2）；跌破分析師低標 10%（+1）。",
+				"估值分歧：|分析師均值-模型合理價| / |模型合理價| > 15%（+2）。",
+				"分析師分歧：分析師區間 high/low > 1.6（+1）。",
+				"基本面/成長：虧損（+1）；營收衰退（+1）；成長股/轉機股且盈餘負成長（+1）。",
+				"波動：Beta > 2（+2）；Beta > 1.6（+1）。",
+				"配息：payoutRatio > 1（+1）；高殖利率+虧損（+1）。",
+				"等級：score>=5 高風險；score>=3 中風險；否則低風險。",
+			],
+		},
+		"confidence": {
+			"title": "信心度（0–100）",
+			"bullets": [
+				"以 50 分為基準，依資料完整度、一致性、波動、獲利品質加減分；最後限制在 0~100。",
+				"估值資料齊全（現價+便宜/合理/昂貴）→ +10。",
+				"分析師一致性：gap=|均值-合理價|/|合理價|；gap<=15% → +15，否則 -20。",
+				"波動：beta<1 → +10；beta>1.5 → -10。",
+				"獲利：profitMargins<0 → -15。",
+				"配息：payoutRatio>1 → -10。",
+				"分析師人數：>=6 → +5；<3 → -5。",
+				"等級：>=80 高；>=60 中；其餘低。",
+			],
+		},
+		"win_rate": {
+			"title": "操作勝率（近 12 期月度命中率）",
+			"bullets": [
+				"取近 13 個月月 K，最多檢查 12 次（需要至少 13 根月收盤）。",
+				"每一期用當期價格與『固定估值帶』產生建議，再用下一期報酬驗證是否命中。",
+				"買進/分批買進：下期報酬 >= +1% 視為命中。",
+				"持有/減碼：下期報酬介於 -3%~+3% 視為命中。",
+				"賣出/減碼：下期報酬 <= -1% 視為命中。",
+				"輸出：命中率 %（命中數/樣本數）；樣本 < 12 會標註『樣本偏少』。",
+				"注意：估值帶用當前快照，屬規則一致性參考，非嚴格無前視回測。",
+			],
+		},
+		"advice": {
+			"title": "操作建議（估值帶 + 分析師修正）",
+			"bullets": [
+				"先用估值帶判斷：P<=便宜價→分批買進；P<=0.95*合理價→買進；P<=昂貴價→持有/減碼；否則賣出/減碼。",
+				"若同時滿足 P<=便宜價 且 P<=分析師低標 → 升級『強烈買進』。",
+				"若同時滿足 P>=昂貴價 且 P>=分析師高標 → 升級『強烈賣出』。",
+				"若模型合理價與分析師均值差距>15%，且兩者方向相反（都明確看多/看空）→ 顯示『觀望/分歧』。",
+			],
+		},
+	}
+	tips_json = json.dumps(tips_payload, ensure_ascii=False)
 	html = f"""
 	<html><head><meta charset='utf-8'/><title>股票估值儀表板</title>
 	<style>
@@ -942,6 +1023,20 @@ def home():
 	  tr:nth-child(even) {{ background:#fbfbfb; }}
 	  .meta {{ color:#555; font-size:12px; margin:8px 0 16px; }}
 	  .near-price {{ color:#d00; font-weight:700; }}
+	  .risk-tags {{ display:flex; flex-wrap:wrap; gap:4px; }}
+	  .risk-tag {{ display:inline-block; padding:2px 6px; border-radius:999px; font-size:12px; background:#fff; border:1px solid #e5e7eb; color:#374151; }}
+	  .flag-diverge {{ display:inline-block; margin-left:6px; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:700; color:#b91c1c; border:1px solid #ef4444; background:#fff1f2; }}
+	  .type-select {{ margin-right:6px; padding:4px 6px; border:1px solid #d1d5db; border-radius:6px; background:#fff; font-size:12px; }}
+	  .type-suffix {{ color:#6b7280; font-size:12px; margin-left:2px; }}
+	  .tip-icon {{ display:inline-block; margin-left:4px; color:#6b7280; font-size:12px; cursor:pointer; user-select:none; }}
+	  dialog.tip-dialog {{ border:1px solid #e5e7eb; border-radius:10px; padding:0; width:min(720px, 92vw); }}
+	  dialog.tip-dialog::backdrop {{ background: rgba(0,0,0,0.35); }}
+	  .tip-head {{ display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid #e5e7eb; background:#f8fafc; }}
+	  .tip-title {{ font-weight:700; }}
+	  .tip-close {{ border:1px solid #d1d5db; background:#fff; border-radius:8px; padding:6px 10px; cursor:pointer; }}
+	  .tip-body {{ padding:12px 14px; }}
+	  .tip-body ul {{ margin:0; padding-left:18px; }}
+	  .tip-body li {{ margin:6px 0; font-size:14px; color:#111827; }}
 	  .risk-high {{ background:#ffe5e5; color:#c40000; font-weight:600; }}
 	  .risk-medium {{ background:#fff6e0; color:#b26b00; }}
 	  .risk-low {{ background:#e9f9ed; color:#0f6b2f; }}
@@ -960,18 +1055,45 @@ def home():
 		  <div class='watchlist' id='watchList'></div>
 		</div>
 		<table><thead><tr>
-		  <th>股票代號</th><th>名稱</th><th>類型</th><th>目前價位</th><th>條件</th>
-		  <th>便宜價</th><th>合理價</th><th>昂貴價</th><th>分析師價位區間</th><th>有效期限</th>
-		  <th>預估上漲或下跌多久</th><th>風險提醒</th><th>信心度</th><th>操作勝率</th><th>操作建議</th>
+		  <th>股票代號</th>
+		  <th>名稱</th>
+		  <th>類型</th>
+		  <th>目前價位</th>
+		  <th>條件</th>
+		  <th>便宜價</th>
+		  <th>合理價</th>
+		  <th>昂貴價</th>
+		  <th>分析師價位區間</th>
+		  <th>有效期限</th>
+		  <th>預估上漲或下跌多久</th>
+		  <th>風險提醒 <span class="tip-icon" data-tip="risk" title="點擊查看完整算法">ⓘ</span></th>
+		  <th>信心度 <span class="tip-icon" data-tip="confidence" title="點擊查看完整算法">ⓘ</span></th>
+		  <th>操作勝率 <span class="tip-icon" data-tip="win_rate" title="點擊查看完整算法">ⓘ</span></th>
+		  <th>操作建議 <span class="tip-icon" data-tip="advice" title="點擊查看完整算法">ⓘ</span></th>
 		</tr></thead><tbody>
 		{table_rows_html}
 		</tbody></table>
 		<script id='current-tickers' type='application/json'>{current_symbols_json}</script>
 		<script id='known-tickers' type='application/json'>{known_list_json}</script>
+		<script id='type-overrides' type='application/json'>{type_overrides_json}</script>
+		<script id='tips-json' type='application/json'>{tips_json}</script>
+		<dialog id="tipDialog" class="tip-dialog">
+		  <div class="tip-head">
+			<div class="tip-title" id="tipTitle">說明</div>
+			<button class="tip-close" id="tipClose" type="button">關閉</button>
+		  </div>
+		  <div class="tip-body" id="tipBody"></div>
+		</dialog>
 		<script>
 		(() => {{
 		  const currentTickers = JSON.parse(document.getElementById('current-tickers').textContent || '[]');
 		  const knownTickers = JSON.parse(document.getElementById('known-tickers').textContent || '[]');
+		  const typeOverrides = JSON.parse(document.getElementById('type-overrides').textContent || '{{}}');
+		  const tips = JSON.parse(document.getElementById('tips-json').textContent || '{{}}');
+		  const tipDialog = document.getElementById('tipDialog');
+		  const tipTitle = document.getElementById('tipTitle');
+		  const tipBody = document.getElementById('tipBody');
+		  const tipClose = document.getElementById('tipClose');
 		  const searchInput = document.getElementById('stockSearch');
 		  const resultsEl = document.getElementById('searchResults');
 		  const watchEl = document.getElementById('watchList');
@@ -989,10 +1111,21 @@ def home():
 			}};
 		  }};
 		
-		  const updateUrl = (list) => {{
+		  const buildTypesParam = (overrides, list) => {{
+			const parts = [];
+			(list || []).forEach((sym) => {{
+			  const t = overrides[sym];
+			  if (t) parts.push(`${{sym}}:${{t}}`);
+			}});
+			return parts.join(',');
+		  }};
+		  const updateUrl = (list, overrides = typeOverrides) => {{
 			const url = new URL(window.location.href);
 			if (list.length) url.searchParams.set('tickers', list.join(','));
 			else url.searchParams.delete('tickers');
+			const typesParam = buildTypesParam(overrides, list);
+			if (typesParam) url.searchParams.set('types', typesParam);
+			else url.searchParams.delete('types');
 			window.location.href = url.toString();
 		  }};
 		
@@ -1056,6 +1189,40 @@ def home():
 		
 		  addBtn.addEventListener('click', () => addTicker(searchInput.value));
 		  clearBtn.addEventListener('click', () => updateUrl([]));
+		  tipClose.addEventListener('click', () => tipDialog.close());
+		  tipDialog.addEventListener('click', (e) => {{
+			// 點擊遮罩區域關閉
+			const rect = tipDialog.getBoundingClientRect();
+			const inDialog = (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom);
+			if (!inDialog) tipDialog.close();
+		  }});
+		  document.querySelectorAll('.tip-icon[data-tip]').forEach((el) => {{
+			el.addEventListener('click', (e) => {{
+			  e.preventDefault();
+			  const key = el.dataset.tip;
+			  const tip = tips[key];
+			  if (!tip) return;
+			  tipTitle.textContent = tip.title || '說明';
+			  const ul = document.createElement('ul');
+			  (tip.bullets || []).forEach((b) => {{
+				const li = document.createElement('li');
+				li.textContent = b;
+				ul.appendChild(li);
+			  }});
+			  tipBody.innerHTML = '';
+			  tipBody.appendChild(ul);
+			  tipDialog.showModal();
+			}});
+		  }});
+		  document.querySelectorAll('.type-select').forEach((sel) => {{
+			sel.addEventListener('change', (e) => {{
+			  const sym = e.target.dataset.symbol;
+			  const val = e.target.value;
+			  if (val === 'auto') delete typeOverrides[sym];
+			  else typeOverrides[sym] = val;
+			  updateUrl(currentTickers, typeOverrides);
+			}});
+		  }});
 		  const onInput = debounce(async (e) => {{
 			const keyword = e.target.value;
 			resultsEl.innerHTML = '';
